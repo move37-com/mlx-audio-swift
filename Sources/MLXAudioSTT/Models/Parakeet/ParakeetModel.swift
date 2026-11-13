@@ -68,6 +68,15 @@ public final class ParakeetModel: Module, STTGenerationModel {
         )
     }
 
+    private var phraseBoost: ParakeetPhraseBoost?
+
+    /// Configure between decodes on the model's owning executor. Empty phrases
+    /// or zero strength restore ordinary greedy decoding.
+    public func setBoostedPhrases(_ phrases: [String], strength: Float = 1) {
+        guard variant == .tdt || variant == .tdtCtc else { return }
+        phraseBoost = ParakeetPhraseBoost(phrases: phrases, vocabulary: vocabulary, strength: strength)
+    }
+
     private var blankTokenId: Int {
         vocabulary.count
     }
@@ -409,15 +418,18 @@ public final class ParakeetModel: Module, STTGenerationModel {
             var state = makeInitialDecoderState(batchSize: 1, dtype: computeDType)
             var currentToken = MLXArray(Int32(lastToken)).reshaped([1, 1]).asType(.int32)
 
+            var phraseState = 0
             while t < maxLength {
                 let frame = featureSeq[0..., t..<(t + 1), 0...]
 
-                let stepOutputs = compiledTDTStep([
+                var inputs = [
                     frame,
                     currentToken,
                     state.hidden!,
                     state.cell!
-                ])
+                ]
+                if let phraseBoost { inputs.append(phraseBoost.biases[phraseState]) }
+                let stepOutputs = compiledTDTStep(inputs)
                 let decisions = stepOutputs[0]
                 let hidden = stepOutputs[1]
                 let cell = stepOutputs[2]
@@ -447,6 +459,7 @@ public final class ParakeetModel: Module, STTGenerationModel {
                 )
 
                 if token != blankToken {
+                    if let phraseBoost { phraseState = phraseBoost.advance(phraseState, token: token) }
                     lastToken = token
                     state = (hidden: hidden, cell: cell)
                     currentToken = MLXArray(Int32(lastToken)).reshaped([1, 1]).asType(.int32)
@@ -497,6 +510,7 @@ public final class ParakeetModel: Module, STTGenerationModel {
             cell: MLXArray.zeros(stateShape, dtype: stateDType)
         )
 
+        var phraseStates = Array(repeating: 0, count: batchSize)
         var timeByRow = Array(repeating: 0, count: batchSize)
         var newSymbolsByRow = Array(repeating: 0, count: batchSize)
         var lastTokenByRow = Array(repeating: blankToken, count: batchSize)
@@ -528,7 +542,13 @@ public final class ParakeetModel: Module, STTGenerationModel {
             let jointOut = joint(activeFrames, pred)
             let tokenLogits = jointOut[0..., 0, 0, ..<(blankToken + 1)]
             let durationLogits = jointOut[0..., 0, 0, (blankToken + 1)...]
-            let tokenArgMax = tokenLogits.argMax(axis: -1).asType(.int32)
+            let scores: MLXArray
+            if let phraseBoost {
+                scores = tokenLogits + MLX.stacked(activeRows.map { phraseBoost.biases[phraseStates[$0]] })
+            } else {
+                scores = tokenLogits
+            }
+            let tokenArgMax = scores.argMax(axis: -1).asType(.int32)
             let durationArgMax = durationLogits.argMax(axis: -1).asType(.int32)
             let decisions = MLX.stacked([tokenArgMax, durationArgMax], axis: 0)
             eval(decisions)
@@ -541,6 +561,9 @@ public final class ParakeetModel: Module, STTGenerationModel {
 
             for (activeIndex, row) in activeRows.enumerated() {
                 let token = predictedTokens[activeIndex]
+                if token != blankToken, let phraseBoost {
+                    phraseStates[row] = phraseBoost.advance(phraseStates[row], token: token)
+                }
                 let decisionIndex = decisionIndices[activeIndex]
                 let currentTime = timeByRow[row]
                 let currentNewSymbols = newSymbolsByRow[row]
@@ -923,7 +946,8 @@ private func makeCompiledTDTStep(
         let jointOut = joint(feature, pred)
         let tokenLogits = jointOut[0, 0, 0, ..<(blankTokenId + 1)]
         let durationLogits = jointOut[0, 0, 0, (blankTokenId + 1)...]
-        let predToken = tokenLogits.argMax(axis: -1).asType(.int32)
+        let scores = arrays.count == 5 ? tokenLogits + arrays[4] : tokenLogits
+        let predToken = scores.argMax(axis: -1).asType(.int32)
         let decision = durationLogits.argMax(axis: -1).asType(.int32)
         let decisions = MLX.stacked([predToken, decision], axis: 0)
         return [decisions, hiddenOut, cellOut]
